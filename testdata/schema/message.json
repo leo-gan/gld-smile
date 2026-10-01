@@ -1,0 +1,23 @@
+{
+  "title": "Message",
+  "$defs": {
+    "Meta": {
+      "type": "object",
+      "required": ["region"],
+      "properties": {
+        "region": {"type": "string"}
+      }
+    }
+  },
+  "type": "object",
+  "required": ["meta", "tags", "blob", "n", "amount", "ok"],
+  "properties": {
+    "meta": {"$ref": "#/$defs/Meta"},
+    "tags": {"type": "array", "items": {"type": "integer"}},
+    "blob": {"type": "binary"},
+    "n": {"type": "biginteger"},
+    "amount": {"type": "bigdecimal"},
+    "ok": {"type": "boolean"},
+    "score": {"type": "number"}
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "title": "Point",
+  "type": "object",
+  "required": ["x"],
+  "properties": {
+    "x": {"type": "integer"},
+    "y": {"type": "integer"},
+    "label": {"type": "string", "enum": ["a", "b"]}
+  }
+}
