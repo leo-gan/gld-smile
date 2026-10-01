@@ -27,7 +27,13 @@ bytes are copied unchanged, so they may include `0xFF`.
 
 Names and values have separate windows of 1024 strings. A new short string is
 appended. When the window is full, it is cleared and the next string is index
-0. A reference does not append another copy.
+0. A reference does not append another copy. The first 64 texts in a document
+are interned, so a repeated key compares as an integer index before any string
+scan. A miss still compares text, which keeps two copies of the same string
+shareable after that cap. Null, bool, integer, and short ASCII values are
+encoded and decoded in one loop, so that index check sits next to the byte it
+emits. A float, a big number, or a long string still uses the general codec,
+and a document can switch at the first such value.
 
 Value indexes 0 through 30 use the one-byte form `0x01` through `0x1F`. Index
 31 and above use the two-byte form. Name indexes 0 through 63 use `0x40`

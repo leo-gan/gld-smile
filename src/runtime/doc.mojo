@@ -87,6 +87,16 @@ struct SmileDoc(Movable):
         return id
 
     def _text(mut self, var s: String) -> Int:
+        # Repeated short keys share one slot so the encoder can match them by index.
+        # The scan stops at 64 so a long document of unique strings stays linear.
+        var limit = len(self.texts)
+        if limit > 64:
+            limit = 64
+        var i = 0
+        while i < limit:
+            if self.texts[i] == s:
+                return i
+            i += 1
         var id = len(self.texts)
         self.texts.append(s^)
         return id
@@ -101,30 +111,29 @@ struct SmileDoc(Movable):
         self.slices.append(sl)
         return id
 
+    def _push(mut self, var n: Node) -> Int:
+        var id = len(self.nodes)
+        self.nodes.append(n^)
+        return id
+
     def add_null(mut self) -> Int:
-        return self._node(K_NULL)
+        return self._push(Node(K_NULL))
 
     def add_bool(mut self, v: Bool) -> Int:
-        var id = self._node(K_BOOL)
-        var n = self.nodes[id]
+        var n = Node(K_BOOL)
         if v:
             n.a = 1
-        self.nodes[id] = n
-        return id
+        return self._push(n^)
 
     def add_i32(mut self, v: Int) -> Int:
-        var id = self._node(K_I32)
-        var n = self.nodes[id]
+        var n = Node(K_I32)
         n.a = v
-        self.nodes[id] = n
-        return id
+        return self._push(n^)
 
     def add_i64(mut self, v: Int) -> Int:
-        var id = self._node(K_I64)
-        var n = self.nodes[id]
+        var n = Node(K_I64)
         n.a = v
-        self.nodes[id] = n
-        return id
+        return self._push(n^)
 
     def add_f32(mut self, v: Float32) -> Int:
         var id = self._node(K_F32)
@@ -152,11 +161,13 @@ struct SmileDoc(Movable):
         return id
 
     def add_string(mut self, var s: String) -> Int:
-        var id = self._node(K_STRING)
-        var n = self.nodes[id]
-        n.a = self._text(s^)
-        self.nodes[id] = n
-        return id
+        return self.add_string_index(self._text(s^))
+
+    def add_string_index(mut self, text_index: Int) -> Int:
+        """A second node for text that is already in the arena. Shared refs use this."""
+        var n = Node(K_STRING)
+        n.a = text_index
+        return self._push(n^)
 
     def add_string_span[origin: ImmOrigin](mut self, raw: Span[Byte, origin], offset: Int) raises DecodeError -> Int:
         var s = string_from_span(raw, offset)
