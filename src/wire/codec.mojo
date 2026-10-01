@@ -17,11 +17,15 @@ from runtime.doc import (
     MAX_DEPTH,
     I32_MAX,
     I32_MIN,
+    Edge,
+    Node,
     SmileDoc,
 )
 from runtime.error import DecodeError
 from runtime.options import EncodeOptions
 from runtime.utf8 import string_from_span
+from wire.hot import decode_hot, encode_hot
+from wire.simple import decode_simple, encode_simple
 
 
 comptime SHARE_LIMIT = 1024
@@ -138,17 +142,7 @@ def decode_7bit(enc: List[Int], raw_n: Int, strict: Bool, offset: Int) raises De
     return out^
 
 
-def _ascii_bytes(s: String) -> List[Byte]:
-    var raw = s.as_bytes()
-    var out = List[Byte]()
-    var i = 0
-    while i < len(raw):
-        out.append(raw[i])
-        i += 1
-    return out^
-
-
-def _is_ascii(raw: List[Byte]) -> Bool:
+def _span_is_ascii[origin: ImmOrigin](raw: Span[Byte, origin]) -> Bool:
     var i = 0
     while i < len(raw):
         if Int(raw[i]) >= 0x80:
@@ -157,10 +151,18 @@ def _is_ascii(raw: List[Byte]) -> Bool:
     return True
 
 
-def _find_share(buf: List[String], s: String) -> Int:
+def _find_id(doc: SmileDoc, ids: List[Int], text_index: Int) -> Int:
     var i = 0
-    while i < len(buf):
-        if (i & 0xFF) < 0xFE and buf[i] == s:
+    while i < len(ids):
+        if (i & 0xFF) < 0xFE and ids[i] == text_index:
+            return i
+        i += 1
+    if len(ids) == 0:
+        return -1
+    var target = doc.texts[text_index]
+    i = 0
+    while i < len(ids):
+        if (i & 0xFF) < 0xFE and doc.texts[ids[i]] == target:
             return i
         i += 1
     return -1
@@ -171,11 +173,12 @@ struct Writer:
     var names_on: Bool
     var values_on: Bool
     var raw_bin: Bool
-    var names: List[String]
-    var values: List[String]
+    var names: List[Int]
+    var values: List[Int]
 
     def __init__(out self, options: EncodeOptions):
         self.buf = List[Byte]()
+        self.buf.reserve(256)
         self.names_on = options.shared_names
         # Without a header the spec forces shared values off and raw binary off.
         if options.header:
@@ -184,8 +187,8 @@ struct Writer:
         else:
             self.values_on = False
             self.raw_bin = False
-        self.names = List[String]()
-        self.values = List[String]()
+        self.names = List[Int]()
+        self.values = List[Int]()
 
     def put(mut self, b: Int):
         self.buf.append(Byte(b & 0xFF))
@@ -203,19 +206,23 @@ struct Writer:
             i += 1
 
     def write_uvint(mut self, u: UInt64, min_bytes: Int):
-        var rev = List[Int]()
-        var x = u
-        rev.append(0x80 | Int(x & 0x3F))
-        x = x >> 6
-        while x > 0:
-            rev.append(Int(x & 0x7F))
-            x = x >> 7
-        while len(rev) < min_bytes:
-            rev.append(0)
-        var i = len(rev) - 1
-        while i >= 0:
-            self.put(rev[i])
+        # Emit the VInt from the high byte. No temporary list: the bench writes
+        # one integer per field, and a heap list dominated that path.
+        var mag = u >> 6
+        var nbytes = 1
+        var tmp = mag
+        while tmp > 0:
+            nbytes += 1
+            tmp = tmp >> 7
+        if nbytes < min_bytes:
+            nbytes = min_bytes
+        var cont = nbytes - 1
+        var i = cont
+        while i > 0:
+            var shift = (i - 1) * 7
+            self.put(Int((mag >> UInt64(shift)) & 0x7F))
             i -= 1
+        self.put(0x80 | Int(u & 0x3F))
 
     def _ref_value(mut self, ix: Int):
         if ix < 31:
@@ -231,75 +238,83 @@ struct Writer:
         self.put(0x30 + (ix >> 8))
         self.put(ix & 0xFF)
 
-    def write_key(mut self, s: String):
-        var raw = _ascii_bytes(s)
-        var n = len(raw)
-        if n == 0:
-            self.put(0x20)
-            return
+    def write_key_at(mut self, doc: SmileDoc, text_index: Int):
         if self.names_on:
-            var ix = _find_share(self.names, s)
+            var ix = _find_id(doc, self.names, text_index)
             if ix >= 0:
                 self._ref_name(ix)
                 return
-        var ascii = _is_ascii(raw)
-        if ascii and n <= 64:
-            self.put(0x7F + n)
-            self.puts(raw)
-        elif (not ascii) and n >= 2 and n <= 57:
-            self.put(0xBE + n)
-            self.puts(raw)
-        else:
-            self.put(0x34)
-            self.puts(raw)
-            self.put(0xFC)
-        if self.names_on:
-            self._push_name(s)
-
-    def _push_name(mut self, s: String):
-        # Slots whose low byte is 0xFE or 0xFF stay in the window so indexes match
-        # the decoder, and _find_share refuses to emit those references.
-        if len(self.names) == SHARE_LIMIT:
-            self.names = List[String]()
-        self.names.append(s)
-
-    def _push_value(mut self, s: String):
-        if len(self.values) == SHARE_LIMIT:
-            self.values = List[String]()
-        self.values.append(s)
-
-    def write_string(mut self, s: String):
-        var raw = _ascii_bytes(s)
-        var n = len(raw)
-        if n == 0:
+        if doc.texts[text_index].byte_length() == 0:
             self.put(0x20)
             return
-        var ascii = _is_ascii(raw)
-        var short = False
-        if ascii and n <= 64:
-            short = True
-        if (not ascii) and n >= 2 and n <= 64:
-            short = True
-        if short and self.values_on:
-            var ix = _find_share(self.values, s)
+        _ = self._write_text(doc, text_index, True)
+        if self.names_on:
+            self._push_name(text_index)
+
+    def _push_name(mut self, text_index: Int):
+        # Slots whose low byte is 0xFE or 0xFF stay in the window so indexes match
+        # the decoder, and _find_id refuses to emit those references.
+        if len(self.names) == SHARE_LIMIT:
+            self.names = List[Int]()
+        self.names.append(text_index)
+
+    def _push_value(mut self, text_index: Int):
+        if len(self.values) == SHARE_LIMIT:
+            self.values = List[Int]()
+        self.values.append(text_index)
+
+    def write_string_at(mut self, doc: SmileDoc, text_index: Int):
+        if self.values_on:
+            var ix = _find_id(doc, self.values, text_index)
             if ix >= 0:
                 self._ref_value(ix)
                 return
+        if doc.texts[text_index].byte_length() == 0:
+            self.put(0x20)
+            return
+        var short = self._write_text(doc, text_index, False)
+        if short and self.values_on:
+            self._push_value(text_index)
+
+    def _write_text(mut self, doc: SmileDoc, text_index: Int, key_mode: Bool) -> Bool:
+        var s = doc.texts[text_index]
+        var n = s.byte_length()
+        var raw = s.as_bytes()
+        var ascii = _span_is_ascii(raw)
+        if key_mode:
+            if ascii and n <= 64:
+                self.put(0x7F + n)
+                self._put_span(raw)
+                return True
+            if (not ascii) and n >= 2 and n <= 57:
+                self.put(0xBE + n)
+                self._put_span(raw)
+                return True
+            self.put(0x34)
+            self._put_span(raw)
+            self.put(0xFC)
+            return True
+        var short = (ascii and n <= 64) or ((not ascii) and n >= 2 and n <= 64)
         if short and ascii:
             self.put(0x3F + n)
-            self.puts(raw)
+            self._put_span(raw)
         elif short:
             self.put(0x7E + n)
-            self.puts(raw)
+            self._put_span(raw)
         else:
             if ascii:
                 self.put(0xE0)
             else:
                 self.put(0xE4)
-            self.puts(raw)
+            self._put_span(raw)
             self.put(0xFC)
-        if short and self.values_on:
-            self._push_value(s)
+        return short
+
+    def _put_span[origin: ImmOrigin](mut self, raw: Span[Byte, origin]):
+        var i = 0
+        while i < len(raw):
+            self.buf.append(raw[i])
+            i += 1
 
     def write_binary_bytes(mut self, raw: List[Byte]):
         var n = len(raw)
@@ -358,8 +373,19 @@ struct Writer:
             self.write_uvint(z, 1)
             return
         if n.kind == K_I64:
+            var z = zz64(n.a)
+            # Values whose zigzag fits in six bits still use five data bytes so the
+            # token stays int64. Four zero groups and one terminator are enough.
+            if z < 64:
+                self.buf.append(Byte(0x25))
+                self.buf.append(Byte(0))
+                self.buf.append(Byte(0))
+                self.buf.append(Byte(0))
+                self.buf.append(Byte(0))
+                self.buf.append(Byte(0x80 | Int(z)))
+                return
             self.put(0x25)
-            self.write_uvint(zz64(n.a), 5)
+            self.write_uvint(z, 5)
             return
         if n.kind == K_F32:
             self.write_f32_bits(n.a)
@@ -368,7 +394,7 @@ struct Writer:
             self.write_f64_bits(doc.f64s[n.a])
             return
         if n.kind == K_STRING:
-            self.write_string(doc.texts[n.a])
+            self.write_string_at(doc, n.a)
             return
         if n.kind == K_BINARY:
             self.write_binary_bytes(doc.slice_copy(n.a))
@@ -396,7 +422,7 @@ struct Writer:
             var i = 0
             while i < n.nchild:
                 var e = doc.edges[n.child + i]
-                self.write_key(doc.texts[e.key])
+                self.write_key_at(doc, e.key)
                 self.write_value(doc, e.val)
                 i += 1
             self.put(0xFB)
@@ -411,8 +437,8 @@ struct Reader[origin: ImmOrigin]:
     var values_on: Bool
     var raw_bin: Bool
     var strict: Bool
-    var names: List[String]
-    var values: List[String]
+    var name_ids: List[Int]
+    var value_ids: List[Int]
     var depth: Int
 
     def __init__(out self, raw: Span[Byte, Self.origin], strict: Bool):
@@ -422,14 +448,15 @@ struct Reader[origin: ImmOrigin]:
         self.values_on = False
         self.raw_bin = False
         self.strict = strict
-        self.names = List[String]()
-        self.values = List[String]()
+        self.name_ids = List[Int]()
+        self.value_ids = List[Int]()
         self.depth = 0
 
     def _b(mut self) raises DecodeError -> Int:
         if self.i >= len(self.raw):
             raise DecodeError(DecodeError.KIND_EOF, self.i)
-        var c = Int(self.raw[self.i])
+        # Bounds were checked above. The pointer load skips the span check on every byte.
+        var c = Int(self.raw.unsafe_ptr().unsafe_load(self.i))
         self.i += 1
         return c
 
@@ -440,19 +467,22 @@ struct Reader[origin: ImmOrigin]:
         var acc = UInt64(0)
         var n = 0
         while True:
-            var b = self._b()
+            if self.i >= len(self.raw):
+                raise DecodeError(DecodeError.KIND_EOF, self.i)
+            var b = Int(self.raw[self.i])
+            self.i += 1
             n += 1
             if n > max_bytes:
                 raise DecodeError(DecodeError.KIND_RANGE, self.i - 1)
             if (b & 0x80) != 0:
                 if self.strict and (b & 0x40) != 0:
                     raise DecodeError(DecodeError.KIND_SYNTAX, self.i - 1)
-                if not _shl_fits(acc, 6):
+                if acc > (UInt64(0xFFFFFFFFFFFFFFFF) >> 6):
                     raise DecodeError(DecodeError.KIND_RANGE, self.i - 1)
                 return (acc << 6) | UInt64(b & 0x3F)
-            if not _shl_fits(acc, 7):
+            if acc > (UInt64(0xFFFFFFFFFFFFFFFF) >> 7):
                 raise DecodeError(DecodeError.KIND_RANGE, self.i - 1)
-            acc = (acc << 7) | UInt64(b & 0x7F)
+            acc = (acc << 7) | UInt64(b)
 
     def _try_header(mut self) raises DecodeError -> Bool:
         if self._remain() < 4:
@@ -469,8 +499,8 @@ struct Reader[origin: ImmOrigin]:
         self.names_on = (flags & 0x01) != 0
         self.values_on = (flags & 0x02) != 0
         self.raw_bin = (flags & 0x04) != 0
-        self.names = List[String]()
-        self.values = List[String]()
+        self.name_ids = List[Int]()
+        self.value_ids = List[Int]()
         self.i += 4
         return True
 
@@ -523,25 +553,25 @@ struct Reader[origin: ImmOrigin]:
         return decode_7bit(enc^, n, self.strict, self.i)
 
     def _shared_value(mut self, mut doc: SmileDoc, ix: Int) raises DecodeError -> Int:
-        if not self.values_on or ix < 0 or ix >= len(self.values):
+        if not self.values_on or ix < 0 or ix >= len(self.value_ids):
             raise DecodeError(DecodeError.KIND_SHARED, self.i)
-        var s = self.values[ix]
-        return doc.add_string(s^)
-
-    def _push_value(mut self, s: String):
-        if len(self.values) == SHARE_LIMIT:
-            self.values = List[String]()
-        self.values.append(s)
-
-    def _push_name(mut self, s: String):
-        if len(self.names) == SHARE_LIMIT:
-            self.names = List[String]()
-        self.names.append(s)
+        return doc.add_string_index(self.value_ids[ix])
 
     def _literal_string(mut self, mut doc: SmileDoc, var s: String, share: Bool) raises DecodeError -> Int:
+        var id = doc.add_string(s^)
         if share and self.values_on:
-            self._push_value(s)
-        return doc.add_string(s^)
+            self._push_value_id(doc.nodes[id].a)
+        return id
+
+    def _push_value_id(mut self, text_index: Int):
+        if len(self.value_ids) == SHARE_LIMIT:
+            self.value_ids = List[Int]()
+        self.value_ids.append(text_index)
+
+    def _push_name_id(mut self, text_index: Int):
+        if len(self.name_ids) == SHARE_LIMIT:
+            self.name_ids = List[Int]()
+        self.name_ids.append(text_index)
 
     def _value(mut self, mut doc: SmileDoc) raises DecodeError -> Int:
         var ch = self._b()
@@ -561,6 +591,22 @@ struct Reader[origin: ImmOrigin]:
                 raise DecodeError(DecodeError.KIND_RANGE, self.i)
             return doc.add_i32(zz_dec32(u))
         if ch == 0x25:
+            if self.i + 5 <= len(self.raw):
+                var b0 = Int(self.raw[self.i])
+                var b1 = Int(self.raw[self.i + 1])
+                var b2 = Int(self.raw[self.i + 2])
+                var b3 = Int(self.raw[self.i + 3])
+                var b4 = Int(self.raw[self.i + 4])
+                if (b0 | b1 | b2 | b3) < 128 and (b4 & 0x80) != 0 and (
+                    not self.strict or (b4 & 0x40) == 0
+                ):
+                    self.i += 5
+                    var acc = UInt64(b0)
+                    acc = (acc << 7) | UInt64(b1)
+                    acc = (acc << 7) | UInt64(b2)
+                    acc = (acc << 7) | UInt64(b3)
+                    acc = (acc << 6) | UInt64(b4 & 0x3F)
+                    return doc.add_i64(zz_dec64(acc))
             var start = self.i
             var u = self._uvint(10)
             if self.strict and self.i - start < 5:
@@ -680,19 +726,21 @@ struct Reader[origin: ImmOrigin]:
         return id
 
     def _name_text(mut self, mut doc: SmileDoc, var s: String, share: Bool) -> Int:
+        var tid = doc._text(s^)
         if share and self.names_on:
-            self._push_name(s)
-        return doc._text(s^)
+            self._push_name_id(tid)
+        return tid
 
     def _shared_name(mut self, mut doc: SmileDoc, ix: Int) raises DecodeError -> Int:
-        if not self.names_on or ix < 0 or ix >= len(self.names):
+        if not self.names_on or ix < 0 or ix >= len(self.name_ids):
             raise DecodeError(DecodeError.KIND_SHARED, self.i)
-        var s = self.names[ix]
-        return doc._text(s^)
+        return self.name_ids[ix]
 
     def _key(mut self, mut doc: SmileDoc) raises DecodeError -> Int:
         """Return a text index, or -1 at the end of an object."""
         var ch = self._b()
+        if ch >= 0x40 and ch <= 0x7F:
+            return self._shared_name(doc, ch - 0x40)
         if ch == 0xFB:
             return -1
         if ch == 0x20:
@@ -708,8 +756,6 @@ struct Reader[origin: ImmOrigin]:
         if ch == 0x34:
             var s = self._long_string(False)
             return self._name_text(doc, s^, True)
-        if ch >= 0x40 and ch <= 0x7F:
-            return self._shared_name(doc, ch - 0x40)
         if ch >= 0x80 and ch <= 0xBF:
             var s = self._take(1 + (ch & 0x3F), True)
             return self._name_text(doc, s^, True)
@@ -726,21 +772,102 @@ struct Reader[origin: ImmOrigin]:
         if self.depth > MAX_DEPTH:
             raise DecodeError(DecodeError.KIND_DEPTH, self.i)
         var id = doc.start_object()
+        var ptr = self.raw.unsafe_ptr()
+        var limit = len(self.raw)
         while True:
-            var key = self._key(doc)
-            if key < 0:
+            if self.i >= limit:
+                raise DecodeError(DecodeError.KIND_EOF, self.i)
+            var ch = Int(ptr.unsafe_load(self.i))
+            self.i += 1
+            if ch == 0xFB:
                 break
-            var v = self._value(doc)
-            doc.add_field(id, key, v)
+            var key: Int
+            if ch >= 0x40 and ch <= 0x7F:
+                var ix = ch - 0x40
+                if not self.names_on or ix >= len(self.name_ids):
+                    raise DecodeError(DecodeError.KIND_SHARED, self.i)
+                key = self.name_ids[ix]
+            else:
+                self.i -= 1
+                key = self._key(doc)
+                if key < 0:
+                    break
+            if self.i >= limit:
+                raise DecodeError(DecodeError.KIND_EOF, self.i)
+            var vb = Int(ptr.unsafe_load(self.i))
+            var val: Int
+            if vb >= 0x01 and vb <= 0x1F:
+                self.i += 1
+                var six = vb - 1
+                if not self.values_on or six >= len(self.value_ids):
+                    raise DecodeError(DecodeError.KIND_SHARED, self.i)
+                var sn = Node(K_STRING)
+                sn.a = self.value_ids[six]
+                val = len(doc.nodes)
+                doc.nodes.append(sn^)
+            elif vb >= 0xC0 and vb <= 0xDF:
+                self.i += 1
+                var z = vb & 0x1F
+                var mag = z >> 1
+                if (z & 1) != 0:
+                    mag = -mag - 1
+                var nn = Node(K_I32)
+                nn.a = mag
+                val = len(doc.nodes)
+                doc.nodes.append(nn^)
+            elif vb == 0x25 and self.i + 6 <= limit:
+                var b0 = Int(ptr.unsafe_load(self.i + 1))
+                var b1 = Int(ptr.unsafe_load(self.i + 2))
+                var b2 = Int(ptr.unsafe_load(self.i + 3))
+                var b3 = Int(ptr.unsafe_load(self.i + 4))
+                var b4 = Int(ptr.unsafe_load(self.i + 5))
+                if (b0 | b1 | b2 | b3) < 128 and (b4 & 0x80) != 0 and (
+                    not self.strict or (b4 & 0x40) == 0
+                ):
+                    self.i += 6
+                    var acc = UInt64(b0)
+                    acc = (acc << 7) | UInt64(b1)
+                    acc = (acc << 7) | UInt64(b2)
+                    acc = (acc << 7) | UInt64(b3)
+                    acc = (acc << 6) | UInt64(b4 & 0x3F)
+                    var nn = Node(K_I64)
+                    nn.a = zz_dec64(acc)
+                    val = len(doc.nodes)
+                    doc.nodes.append(nn^)
+                else:
+                    val = self._value(doc)
+            else:
+                val = self._value(doc)
+            var parent = doc.nodes[id]
+            if parent.child < 0 or parent.child + parent.nchild != len(doc.edges):
+                var start = len(doc.edges)
+                var j = 0
+                var base = parent.child
+                while j < parent.nchild:
+                    doc.edges.append(doc.edges[base + j])
+                    j += 1
+                parent.child = start
+            doc.edges.append(Edge(key, val))
+            parent.nchild += 1
+            doc.nodes[id] = parent
         self.depth -= 1
         return id
 
     def read_doc(mut self) raises DecodeError -> SmileDoc:
         var doc = SmileDoc()
+        var cap = len(self.raw)
+        if cap < 8:
+            cap = 8
+        doc.nodes.reserve(cap)
+        doc.edges.reserve(cap)
+        doc.texts.reserve(32)
         if self._remain() == 0:
             return doc^
         if Int(self.raw[self.i]) == 0x3A:
             _ = self._try_header()
+        return self._finish(doc^)
+
+    def _finish(mut self, var doc: SmileDoc) raises DecodeError -> SmileDoc:
         while self._remain() > 0:
             var c = Int(self.raw[self.i])
             if c == 0xFF:
@@ -757,6 +884,14 @@ struct Reader[origin: ImmOrigin]:
 
 
 def encode(doc: SmileDoc, options: EncodeOptions) raises DecodeError -> List[Byte]:
+    # Objects of small ints and short ASCII are encoded in wire.hot. The broader
+    # simple subset uses wire.simple. Floats and big numbers stay on Writer.
+    var hot = encode_hot(doc, options)
+    if hot.ok:
+        return hot.take_buf()
+    var fast = encode_simple(doc, options)
+    if fast.ok:
+        return fast.take_buf()
     var w = Writer(options)
     if options.header:
         w.put(0x3A)
@@ -780,5 +915,23 @@ def encode(doc: SmileDoc, options: EncodeOptions) raises DecodeError -> List[Byt
 
 
 def decode[origin: ImmOrigin](raw: Span[Byte, origin], strict: Bool) raises DecodeError -> SmileDoc:
+    # Strict mode stays on Reader so unused 1-bits still raise. A partial simple
+    # prefix keeps its share windows and Reader continues at the first other token.
+    if not strict:
+        var hot = decode_hot(raw)
+        if hot.ok:
+            return hot.take_doc()
+        var part = decode_simple(raw)
+        if part.done:
+            return part.take_doc()
+        if part.i > 0:
+            var resume = Reader(raw, strict)
+            resume.i = part.i
+            resume.names_on = part.names_on
+            resume.values_on = part.values_on
+            resume.raw_bin = part.raw_bin
+            resume.name_ids = part.take_names()
+            resume.value_ids = part.take_values()
+            return resume._finish(part.take_doc())
     var r = Reader(raw, strict)
     return r.read_doc()
