@@ -1,5 +1,7 @@
 # mojo-smile
 
+[Serialization](https://leo-gan.github.io/serialization/) is the hub for the theory, the history, and the benchmarks.
+
 A from-scratch [Smile](https://github.com/FasterXML/smile-format-specification) implementation for
 [Mojo](https://mojolang.org/). The runtime and the code generator are written
 in Mojo. They do not wrap, link, or vendor Jackson, libsmile, or any other C,
