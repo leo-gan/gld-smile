@@ -690,23 +690,49 @@ struct Reader[origin: ImmOrigin]:
         return bits
 
     def _f64(mut self) raises DecodeError -> UInt64:
-        var raw = List[Int]()
-        var k = 0
-        while k < 10:
-            var b = self._b()
-            if (b & 0x80) != 0:
-                raise DecodeError(DecodeError.KIND_SYNTAX, self.i - 1)
-            raw.append(b)
-            k += 1
-        if self.strict and (raw[0] & 0x7E) != 0:
+        # Ten data bytes, no heap list. A list per float dominated telemetry decode.
+        var b0 = self._b()
+        if (b0 & 0x80) != 0:
+            raise DecodeError(DecodeError.KIND_SYNTAX, self.i - 1)
+        var b1 = self._b()
+        if (b1 & 0x80) != 0:
+            raise DecodeError(DecodeError.KIND_SYNTAX, self.i - 1)
+        var b2 = self._b()
+        if (b2 & 0x80) != 0:
+            raise DecodeError(DecodeError.KIND_SYNTAX, self.i - 1)
+        var b3 = self._b()
+        if (b3 & 0x80) != 0:
+            raise DecodeError(DecodeError.KIND_SYNTAX, self.i - 1)
+        var b4 = self._b()
+        if (b4 & 0x80) != 0:
+            raise DecodeError(DecodeError.KIND_SYNTAX, self.i - 1)
+        var b5 = self._b()
+        if (b5 & 0x80) != 0:
+            raise DecodeError(DecodeError.KIND_SYNTAX, self.i - 1)
+        var b6 = self._b()
+        if (b6 & 0x80) != 0:
+            raise DecodeError(DecodeError.KIND_SYNTAX, self.i - 1)
+        var b7 = self._b()
+        if (b7 & 0x80) != 0:
+            raise DecodeError(DecodeError.KIND_SYNTAX, self.i - 1)
+        var b8 = self._b()
+        if (b8 & 0x80) != 0:
+            raise DecodeError(DecodeError.KIND_SYNTAX, self.i - 1)
+        var b9 = self._b()
+        if (b9 & 0x80) != 0:
+            raise DecodeError(DecodeError.KIND_SYNTAX, self.i - 1)
+        if self.strict and (b0 & 0x7E) != 0:
             raise DecodeError(DecodeError.KIND_SYNTAX, self.i - 10)
-        var bits = UInt64(raw[0] & 0x01) << 63
-        var shift = 56
-        var j = 1
-        while j < 10:
-            bits = bits | (UInt64(raw[j] & 0x7F) << UInt64(shift))
-            shift -= 7
-            j += 1
+        var bits = UInt64(b0 & 0x01) << 63
+        bits = bits | (UInt64(b1 & 0x7F) << 56)
+        bits = bits | (UInt64(b2 & 0x7F) << 49)
+        bits = bits | (UInt64(b3 & 0x7F) << 42)
+        bits = bits | (UInt64(b4 & 0x7F) << 35)
+        bits = bits | (UInt64(b5 & 0x7F) << 28)
+        bits = bits | (UInt64(b6 & 0x7F) << 21)
+        bits = bits | (UInt64(b7 & 0x7F) << 14)
+        bits = bits | (UInt64(b8 & 0x7F) << 7)
+        bits = bits | UInt64(b9 & 0x7F)
         return bits
 
     def _array(mut self, mut doc: SmileDoc) raises DecodeError -> Int:
