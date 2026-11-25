@@ -26,6 +26,29 @@ var raw = encode_doc(doc, EncodeOptions())
 var back = decode_bytes(Span(raw))
 ```
 
+`SmileBin` writes the same subset without a `SmileDoc`. `begin` writes the
+header with shared names on. The first use of a key stores it in the name
+window; a later `key_lit` of that key is a one-byte backref. The value bytes
+are written on every call. `SmileCur` reads the bytes, and `decode` accepts
+them as well.
+
+```mojo
+from wire.direct import SmileBin, SmileCur
+
+var bin = SmileBin()
+bin.begin()
+bin.start_object()
+bin.key_lit("id")
+bin.write_i64(7)
+bin.end_object()
+var raw = bin^.take()
+var cur = SmileCur(Span(raw))
+cur.open()
+cur.start_object()
+_ = cur.next_id()
+print(cur.read_i64())
+```
+
 A generated `Point` has the same three methods as the other gld serializers.
 `encoded_len` returns the byte count. `encode_to` appends those bytes to a
 list. `decode_from` fills the struct from a span.
